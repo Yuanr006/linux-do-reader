@@ -119,6 +119,18 @@ function isUnreadMarkerActive(marker, viewport = {}) {
   return Boolean((rect.width || rect.height));
 }
 
+function isUnreadMarkerVisible(marker, viewport = {}) {
+  if (!isUnreadMarkerActive(marker, viewport)) return false;
+  const rect = typeof marker.getBoundingClientRect === 'function'
+    ? marker.getBoundingClientRect()
+    : { y: 0, width: 1, height: 1 };
+  const topEdgeMargin = Number.isFinite(viewport.topEdgeMargin) ? viewport.topEdgeMargin : 0;
+  const bottomEdgeMargin = Number.isFinite(viewport.bottomEdgeMargin) ? viewport.bottomEdgeMargin : 0;
+  const height = Number.isFinite(viewport.height) ? viewport.height : 0;
+  const markerHeight = Number.isFinite(rect.height) ? rect.height : 0;
+  return rect.y >= topEdgeMargin && rect.y + markerHeight <= height - bottomEdgeMargin;
+}
+
 function randomDelayMs(minMs, maxMs) {
   const min = Math.max(0, Number(minMs));
   const max = Math.max(min, Number(maxMs));
@@ -130,6 +142,7 @@ module.exports = {
   extractTopicId,
   isTopicDone,
   isUnreadMarkerActive,
+  isUnreadMarkerVisible,
   parseVisiblePostNumber,
   parseReplyCount,
   randomDelayMs,

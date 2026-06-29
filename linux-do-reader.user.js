@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LINUX DO 阅读助手
 // @namespace    https://linux.do/
-// @version      0.3.1
+// @version      0.6.13
 // @description  以可控节奏打开未读话题并滚动阅读，帮助把实际浏览过的内容标记为已读。
 // @match        https://linux.do/*
 // @grant        none
@@ -13,20 +13,27 @@
 
   const CONFIG_KEY = 'linuxDoReaderConfig';
   const STATE_KEY = 'linuxDoReaderState';
-  const READ_TOPIC_IDS_KEY = 'linuxDoReaderReadTopicIds';
+  const SCRIPT_VERSION = '0.6.13';
   const DEFAULT_CONFIG = {
-    maxTopics: 10,
+    maxTopics: 100,
     maxPostsPerTopic: -1,
-    minDelayMs: 1200,
-    maxDelayMs: 2000,
-    scrollRatio: 0.78,
+    minDelayMs: 1500,
+    maxDelayMs: 5200,
+    scrollRatio: 0.55,
     maxStableRounds: 2,
     maxRoundsPerTopic: 260,
-    minTopicCooldownMs: 3000,
-    maxTopicCooldownMs: 8000,
+    minTopicCooldownMs: 1000,
+    maxTopicCooldownMs: 3000,
     priority: 'topic',
-    initialReadDelayMs: 2500,
     unreadTopMargin: -200,
+    unreadVisibleTopMargin: 80,
+    unreadVisibleBottomMargin: 120,
+    unreadWaitTimeoutMs: 12000,
+    unreadWaitPollMs: 600,
+    maxVisibleUnreadBeforeWait: 3,
+    unreadFinalCheckRounds: 2,
+    unreadFinalCheckDelayMs: 1800,
+    unreadStuckNudgeLimit: 3,
     likeMainPost: false,
   };
 
@@ -76,23 +83,6 @@
     if (!normalized) return null;
     const match = normalized.match(/\/t\/(?:[^/]+\/)?(\d+)(?:\/\d+)?(?:[?#].*)?$/);
     return match ? match[1] : null;
-  }
-
-  function getReadTopicIds() {
-    try {
-      const ids = JSON.parse(localStorage.getItem(READ_TOPIC_IDS_KEY) || '[]');
-      return Array.isArray(ids) ? ids : [];
-    } catch (_) {
-      return [];
-    }
-  }
-
-  function rememberReadTopicId(url, explicitId) {
-    const id = explicitId || extractTopicId(url);
-    if (!id) return;
-    const ids = getReadTopicIds().filter(Boolean);
-    const next = Array.from(new Set([...ids, id])).slice(-1000);
-    localStorage.setItem(READ_TOPIC_IDS_KEY, JSON.stringify(next));
   }
 
   function sleep(ms) {
@@ -166,14 +156,13 @@
   }
 
   function collectHotTopicUrls(limit) {
-    const readIds = new Set(getReadTopicIds());
     const candidates = [];
 
     for (const row of document.querySelectorAll('.topic-list-item')) {
       const link = row.querySelector('a.title[href], a.raw-topic-link[href], a[href*="/t/"]');
       const url = link?.href || link?.getAttribute('href');
       const topicId = extractTopicId(url);
-      if (!url || !topicId || readIds.has(topicId)) continue;
+      if (!url || !topicId) continue;
 
       candidates.push({
         url,
@@ -199,8 +188,23 @@
     return window.scrollY + window.innerHeight >= doc.scrollHeight - 80;
   }
 
+  function reachedRecommendedTopics() {
+    const moreTopics = document.querySelector('.more-topics__container');
+    if (!moreTopics) return false;
+    const rect = moreTopics.getBoundingClientRect();
+    return rect.top <= window.innerHeight;
+  }
+
+  function unreadMarkers() {
+    return Array.from(document.querySelectorAll('.read-state'));
+  }
+
   function unreadPostCount() {
-    return Array.from(document.querySelectorAll('.read-state')).filter(isUnreadMarkerActive).length;
+    return unreadMarkers().filter(isUnreadMarkerActive).length;
+  }
+
+  function visibleUnreadPostCount() {
+    return unreadMarkers().filter(isUnreadMarkerVisible).length;
   }
 
   function isUnreadMarkerActive(marker) {
@@ -215,6 +219,61 @@
     const rect = marker.getBoundingClientRect();
     if (rect.y < loadJson(CONFIG_KEY, DEFAULT_CONFIG).unreadTopMargin) return false;
     return Boolean(rect.width || rect.height);
+  }
+
+  function isUnreadMarkerVisible(marker) {
+    if (!isUnreadMarkerActive(marker)) return false;
+    const config = loadJson(CONFIG_KEY, DEFAULT_CONFIG);
+    const rect = marker.getBoundingClientRect();
+    return rect.y >= config.unreadVisibleTopMargin
+      && rect.y + rect.height <= window.innerHeight - config.unreadVisibleBottomMargin;
+  }
+
+  async function waitForVisibleUnreadToClear(config) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < config.unreadWaitTimeoutMs) {
+      const state = getState();
+      if (!state.running) return false;
+      const visibleUnread = visibleUnreadPostCount();
+      if (visibleUnread === 0) return true;
+      setState({ status: `等待当前小蓝点消失，剩余:${visibleUnread}` });
+      await sleep(config.unreadWaitPollMs);
+    }
+    return visibleUnreadPostCount() === 0;
+  }
+
+  async function confirmVisibleUnreadStuck(config) {
+    for (let round = 0; round < config.unreadFinalCheckRounds; round += 1) {
+      await sleep(config.unreadFinalCheckDelayMs);
+      const state = getState();
+      if (!state.running) return false;
+      const visibleUnread = visibleUnreadPostCount();
+      if (visibleUnread === 0) return false;
+      setState({ status: `复查小蓝点是否仍未消失，剩余:${visibleUnread}` });
+    }
+    return visibleUnreadPostCount() > 0;
+  }
+
+  async function nudgePastStuckUnread(config) {
+    setState({ status: '小蓝点暂未消失，继续下滑复查' });
+    window.scrollBy({
+      top: Math.max(180, Math.floor(window.innerHeight * 0.28)),
+      left: 0,
+      behavior: 'smooth',
+    });
+    await sleep(randomDelayMs(
+      Math.max(600, Math.floor(config.minDelayMs * 0.5)),
+      Math.max(900, Math.floor(config.maxDelayMs * 0.5)),
+    ));
+  }
+
+  function stopForUnreadStuck() {
+    const message = '小蓝点持续不消失，可能触发平台风控。请换 VPN 节点，访问 https://linux.do/challenge（提示“页面不存在或者是一个不公开页面”是正常的），稍后再继续。';
+    setState({
+      running: false,
+      status: message,
+    });
+    window.alert(message);
   }
 
   function visiblePostProgress() {
@@ -296,10 +355,11 @@
     let state = getState();
     const currentUrl = normalizeUrl(location.href);
     let stableRounds = 0;
+    let stuckNudgeRounds = 0;
     let lastHeight = 0;
+    let lastPostNumber = null;
 
     window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
-    await sleep(config.initialReadDelayMs);
     const likedMainPost = await likeMainPostIfEnabled(config);
 
     for (let round = 0; round < config.maxRoundsPerTopic; round += 1) {
@@ -307,13 +367,43 @@
       if (!state.running) return;
 
       const unread = unreadPostCount();
+      const visibleUnread = visibleUnreadPostCount();
       const progress = visiblePostProgress();
       const postProgress = parseVisiblePostNumber(progress);
+      const waitText = visibleUnread > 0 ? ` 等待:${visibleUnread}` : '';
       setState({
-        status: `阅读中 ${state.count + 1}/${config.maxTopics} ${progress} 未读标记:${unread}${likedMainPost ? ' 已点赞主帖' : ''}`,
+        status: `阅读中 ${state.count + 1}/${config.maxTopics} ${progress} 未读标记:${unread}${waitText}${likedMainPost ? ' 已点赞主帖' : ''}`,
       });
 
       const docHeight = document.documentElement.scrollHeight;
+      if (visibleUnread >= config.maxVisibleUnreadBeforeWait) {
+        const cleared = await waitForVisibleUnreadToClear(config);
+        if (!cleared) {
+          if (!getState().running) return;
+          const stuck = await confirmVisibleUnreadStuck(config);
+          if (!stuck) continue;
+          stuckNudgeRounds += 1;
+          if (stuckNudgeRounds > config.unreadStuckNudgeLimit) {
+            stopForUnreadStuck();
+            return;
+          }
+          await nudgePastStuckUnread(config);
+          continue;
+        }
+      }
+      stuckNudgeRounds = 0;
+
+      if (postProgress) {
+        if (lastPostNumber === null) {
+          lastPostNumber = postProgress.current;
+        } else {
+          const readPosts = Math.max(0, postProgress.current - lastPostNumber);
+          if (readPosts > 0) {
+            lastPostNumber = postProgress.current;
+          }
+        }
+      }
+
       if (config.maxPostsPerTopic > 0 && postProgress && postProgress.current >= config.maxPostsPerTopic) {
         setState({
           status: `达到每话题 ${config.maxPostsPerTopic} 帖上限，准备返回主页`,
@@ -321,8 +411,15 @@
         break;
       }
 
+      if (reachedRecommendedTopics()) {
+        setState({ status: '已到达推荐话题区域，结束当前话题' });
+        break;
+      }
+
       if (nearBottom() && unread === 0 && stableRounds >= config.maxStableRounds) break;
 
+      state = getState();
+      if (!state.running) return;
       if (nearBottom() && docHeight === lastHeight) {
         stableRounds += 1;
       } else {
@@ -336,13 +433,17 @@
         behavior: 'smooth',
       });
       await sleep(randomDelayMs(config.minDelayMs, config.maxDelayMs));
+
+      if (reachedRecommendedTopics()) {
+        setState({ status: '已到达推荐话题区域，结束当前话题' });
+        break;
+      }
     }
 
     state = getState();
     if (!state.running) return;
 
     const visited = Array.from(new Set([...state.visited, currentUrl].filter(Boolean)));
-    rememberReadTopicId(currentUrl, state.currentTopicId);
     const cooldownMs = randomDelayMs(config.minTopicCooldownMs, config.maxTopicCooldownMs);
     setState({
       visited,
@@ -380,7 +481,7 @@
     return `
       <label style="display:flex;align-items:center;gap:6px;justify-content:space-between;">
         <span>${label}</span>
-        <input data-ldr-config="${key}" type="number" value="${value}" min="${min}"
+        <input data-ldr-config="${key}" type="number" value="${value}" min="${min}" step="1"
           style="width:${width || 72}px;box-sizing:border-box;border:1px solid #b9c2cf;border-radius:4px;padding:3px 5px;">
       </label>
     `;
@@ -443,9 +544,24 @@
       document.body.appendChild(panel);
     }
 
+    if (state.running) {
+      panel.style.width = '220px';
+      panel.innerHTML = `
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+          <strong>阅读助手 <span style="font-weight:500;color:#64748b;">v${SCRIPT_VERSION}</span></strong>
+          <span style="color:#1473e6;">运行中</span>
+        </div>
+        <div style="color:#475569;word-break:break-word;margin-bottom:8px;">${state.status || '运行中'}</div>
+        <button data-ldr-action="stop" style="width:100%;border:1px solid #b9c2cf;border-radius:5px;background:#fff;color:#1f2937;padding:6px 8px;cursor:pointer;">停止</button>
+      `;
+      panel.querySelector('[data-ldr-action="stop"]').addEventListener('click', () => stopReader('手动停止'));
+      return;
+    }
+
+    panel.style.width = '248px';
     panel.innerHTML = `
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-        <strong>LINUX DO 阅读助手</strong>
+        <strong>LINUX DO 阅读助手 <span style="font-weight:500;color:#64748b;">v${SCRIPT_VERSION}</span></strong>
         <span style="color:${state.running ? '#1473e6' : '#64748b'}">${state.running ? '运行中' : '空闲'}</span>
       </div>
       <div style="display:grid;gap:6px;margin-bottom:8px;">
@@ -453,7 +569,7 @@
         ${checkboxInput('主帖点赞', 'likeMainPost', config.likeMainPost)}
         ${numberInput('话题上限', 'maxTopics', config.maxTopics)}
         ${numberInput('每话题最多帖子', 'maxPostsPerTopic', config.maxPostsPerTopic, 88)}
-        ${numberInput('主帖停留(ms)', 'initialReadDelayMs', config.initialReadDelayMs, 88)}
+        ${numberInput('未读等待阈值', 'maxVisibleUnreadBeforeWait', config.maxVisibleUnreadBeforeWait, 88)}
         ${numberInput('最短停留(ms)', 'minDelayMs', config.minDelayMs, 88)}
         ${numberInput('最长停留(ms)', 'maxDelayMs', config.maxDelayMs, 88)}
         ${numberInput('冷却最短(ms)', 'minTopicCooldownMs', config.minTopicCooldownMs, 88)}
@@ -461,9 +577,8 @@
       </div>
       <div style="display:flex;gap:8px;margin-bottom:8px;">
         <button data-ldr-action="start" style="flex:1;border:0;border-radius:5px;background:#1473e6;color:#fff;padding:6px 8px;cursor:pointer;">开始</button>
-        <button data-ldr-action="stop" style="flex:1;border:1px solid #b9c2cf;border-radius:5px;background:#fff;color:#1f2937;padding:6px 8px;cursor:pointer;">停止</button>
+      <button data-ldr-action="stop" style="flex:1;border:1px solid #b9c2cf;border-radius:5px;background:#fff;color:#1f2937;padding:6px 8px;cursor:pointer;">停止</button>
       </div>
-      <button data-ldr-action="clear-read" style="width:100%;border:1px solid #d7dde6;border-radius:5px;background:#fff;color:#475569;padding:5px 8px;cursor:pointer;margin-bottom:8px;">清空已读记录</button>
       <button data-ldr-action="reset-config" style="width:100%;border:1px solid #d7dde6;border-radius:5px;background:#fff;color:#475569;padding:5px 8px;cursor:pointer;margin-bottom:8px;">重置设置</button>
       <div style="color:#475569;word-break:break-word;">${state.status || '空闲'}</div>
     `;
@@ -486,10 +601,6 @@
 
     panel.querySelector('[data-ldr-action="start"]').addEventListener('click', startReader);
     panel.querySelector('[data-ldr-action="stop"]').addEventListener('click', () => stopReader('手动停止'));
-    panel.querySelector('[data-ldr-action="clear-read"]').addEventListener('click', () => {
-      localStorage.removeItem(READ_TOPIC_IDS_KEY);
-      setState({ status: '已清空热门话题已读记录' });
-    });
     panel.querySelector('[data-ldr-action="reset-config"]').addEventListener('click', () => {
       saveJson(CONFIG_KEY, DEFAULT_CONFIG);
       setState({ status: '已恢复默认设置' });
